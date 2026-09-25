@@ -1639,24 +1639,32 @@ void ScribbleTest::reopen(const std::string& path, int saveflags, bool loadall)
 // replay
 
 // Elements get ids in order of first appearance: input.html's elements in document order, then each element
-//  as it appears after a trace line.  An element keeps its id while it is in the document, and on returning
-//  (undo) if its bounds are unchanged; a new Element at the address of a freed one gets a new id.
+//  as it appears after a trace line.  The id is stored in the element (Element::uuid = id + 1; only whiteboard
+//  sync uses uuid otherwise), never keyed by address.  Clones (paste, free-erase pieces) copy uuid, so an
+//  element keeps the id it carries only if it held that id at the previous line, or if it returns (undo) with
+//  the bounds and point count it had when it left; otherwise it gets a new id.
 struct ReplayIds
 {
-  struct Rec { int id; Rect bbox; };
-  std::map<Element*, Rec> recs;
+  struct Rec { Element* owner; Rect bbox; int npts; };
+  std::vector<Rec> recs;  // by id
   std::set<int> live;
-  int nextId = 0;
+
+  static int id(const Element* e) { return int(e->uuid) - 1; }
+  static int npts(Element* e)
+      { return e->isPathElement() ? static_cast<SvgPath*>(e->node)->path()->size() : 0; }
 
   void visit(Element* e, const std::set<int>& prevLive)
   {
-    auto it = recs.find(e);
-    if(it == recs.end() || (!prevLive.count(it->second.id) && it->second.bbox != e->bbox())) {
-      recs[e] = Rec{nextId++, e->bbox()};
-      it = recs.find(e);
+    int k = id(e);
+    bool keep = k >= 0 && k < int(recs.size()) && !live.count(k)
+        && ((prevLive.count(k) && recs[k].owner == e) || (recs[k].bbox == e->bbox() && recs[k].npts == npts(e)));
+    if(!keep) {
+      k = recs.size();
+      recs.emplace_back();
+      e->uuid = k + 1;
     }
-    it->second.bbox = e->bbox();
-    live.insert(it->second.id);
+    recs[k] = Rec{e, e->bbox(), npts(e)};
+    live.insert(k);
     if(e->isMultiStroke()) {
       for(Element* c : e->children())
         visit(c, prevLive);
@@ -1817,7 +1825,7 @@ static void writeElement(std::ostream& out, Element* e, ReplayIds& ids, const Tr
     bool penpoints, const std::string& indent)
 {
   const Transform2D& tf = e->node->getTransform();
-  out << indent << "{\"id\": " << ids.recs[e].id << ", ";
+  out << indent << "{\"id\": " << ReplayIds::id(e) << ", ";
   writeTransform(out, tf);
   if(penpoints && e->isPathElement()) {
     // Element::toPenPoints gives the centerline in the element's own coordinates; write it in page units
@@ -1903,12 +1911,12 @@ void ScribbleTest::replay(const std::string& casedir)
       writeElement(json, e, ids, Transform2D(), penpoints, "  ");
       first = false;
       if(scribbleArea->currSelection && e->isSelected(scribbleArea->currSelection))
-        selected.insert(ids.recs[e].id);
+        selected.insert(ReplayIds::id(e));
     }
     json << "]}";
   }
   std::set<int> deleted;
-  for(int id = 0; id < ids.nextId; ++id)
+  for(int id = 0; id < int(ids.recs.size()); ++id)
     if(!ids.live.count(id)) deleted.insert(id);
   json << "],\n\"selected\": ";
   writeIdList(json, selected);
