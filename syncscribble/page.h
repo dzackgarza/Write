@@ -99,4 +99,6 @@ public:
   static const color_t DEFAULT_RULE_COLOR = Color::BLUE;
   //static const int NOT_AUTO_SAVED = INT_MAX;
   static bool enableDropShadow;
+  // source of stroke timestamps; ScribbleTest::replay substitutes the trace time
+  static Timestamp (*clock)();
 };

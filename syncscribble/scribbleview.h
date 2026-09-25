@@ -32,6 +32,8 @@ public:
   virtual void doPressEvent(const InputEvent& event) {}
   virtual void doMoveEvent(const InputEvent& event) {}
   virtual void doReleaseEvent(const InputEvent& event) {}
+  // origin of page 0 in view (dim) coordinates, for ScribbleInput::traceLog; false if the view has no pages
+  virtual bool tracePageOrigin(Point* origin) const { return false; }
   virtual bool doClickAction(Point pos) { return true; }
   virtual void doDblClickAction(Point pos) {}
   virtual void doLongPressAction(Point pos) {}

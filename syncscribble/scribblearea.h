@@ -93,6 +93,7 @@ protected:
   void doPressEvent(const InputEvent& event) override;
   void doMoveEvent(const InputEvent& event) override;
   void doReleaseEvent(const InputEvent& event) override;
+  bool tracePageOrigin(Point* origin) const override { *origin = getPageOrigin(0);  return true; }
   bool doClickAction(Point pos) override;
   void doDblClickAction(Point pos) override;
   void doMotionEvent(const InputEvent& event, inputevent_t eventtype) override;

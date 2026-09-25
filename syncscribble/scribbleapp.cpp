@@ -2773,6 +2773,16 @@ std::string ScribbleApp::runTest(std::string runtype)
     test.runAll();
     return test.resultStr;
   }
+  else if(runtype == "replaytest") {
+    // replay each case directory under $WRITE_REPLAY_DIR (ScribbleTest::replay); env var because
+    //  setConfigValue rejects unknown keys
+    const char* dir = getenv("WRITE_REPLAY_DIR");
+    if(!dir)
+      return "replaytest requires WRITE_REPLAY_DIR";
+    ScribbleTest test(SCRIBBLE_TEST_PATH);
+    test.replayAll(dir);
+    return test.resultStr;
+  }
   else if(runtype == "synctest") {
     ScribbleTest test(SCRIBBLE_TEST_PATH);
     // set server for synctest

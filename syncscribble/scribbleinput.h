@@ -2,6 +2,8 @@
 #define SCRIBBLEINPUT_H
 
 #include <vector>
+#include <cstdio>
+#include <string>
 #include "basics.h"
 #include "ulib/geom.h"
 
@@ -76,6 +78,9 @@ public:
   static int pressedKey;
   static bool disableTouch;
   static bool simulatePenBtn;
+  // when set, each single-point input event is written here as an "ie" line of the replay grammar
+  static FILE* traceLog;
+  static std::string traceReal(double x);
 
   ScribbleInput(ScribbleView* _parent);
   void loadConfig();

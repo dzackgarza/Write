@@ -1,5 +1,9 @@
 #include "scribbletest.h"
 #include <fstream>
+#include <sstream>
+#include <map>
+#include <set>
+#include <cstdarg>
 
 #include "usvg/svgparser.h"
 #include "application.h"
@@ -53,7 +57,7 @@ ScribbleTest::ScribbleTest(const std::string& path)
   scribbleMode = new ScribbleMode(scribbleConfig);
   // NOTE: if you remove or change this, you must find another way to init erase, select, ins space modes!
   scribbleMode->setRuled(true);
-  scribbleMode->setMode(MODE_STROKE);
+  setMode(MODE_STROKE);
   scribbleDoc = new ScribbleDoc(ScribbleApp::app, scribbleConfig, scribbleMode);
   scribbleArea = new ScribbleArea();
   scribbleDoc->addArea(scribbleArea);
@@ -67,7 +71,7 @@ ScribbleTest::ScribbleTest(const std::string& path)
   screenRect = Rect::ltwh(0,0,600,800);
   screenImg = new Image(screenRect.width(), screenRect.height());
   screenPaint = new Painter(Painter::PAINT_SW, screenImg);  //| Painter::SRGB_AWARE
-  scribbleArea->screenRect = screenRect;
+  setScreenRect(screenRect);
   screenPaint->beginFrame();
   scribbleArea->doPaintEvent(screenPaint);  // ensure that ScribbleView::imgPaint is inited
   screenPaint->endFrame();
@@ -187,6 +191,42 @@ bool ScribbleTest::testCompareFiles(const char* f1, const char* f2, bool svgonly
   return b1.size() == b2.size() && strcmp(b1.data(), b2.data()) == 0;
 }
 
+// per-test document setup, shared by runAll and replay
+void ScribbleTest::setupTest(const std::string& inpath)
+{
+  scribbleDoc->newDocument();
+  // attempt to open input file; fails quietly if not present
+  Document::loadresult_t res = scribbleDoc->openDocument(inpath.c_str());
+  if(res == Document::LOAD_NONFATAL) {
+    scribbleDoc->checkAndClearErrors();
+    scribbleDoc->cfg->set("test_loadErrors", true);
+  }
+  // reset mode
+  scribbleMode->setRuled(true);
+  scribbleMode->setMode(MODE_STROKE);
+  scribbleDoc->app->setPen(ScribblePen(Color::BLACK, 1, ScribblePen::TIP_ROUND));
+  scribbleDoc->app->bookmarkColor = Color::BLUE;
+  // prevent unintended updates while inspecting:
+  scribbleDoc->cfg->set("savePrompt", true);
+}
+
+// write the document in the form runAll compares with a *_ref.html file; shared by runAll and replay
+void ScribbleTest::saveTestOutput(const std::string& outfile)
+{
+  // distribute transform to stroke points to match old behavior ... remove this later(?)
+  distributeTransform(scribbleDoc->document);
+  screenPaint->beginFrame();
+  scribbleArea->doPaintEvent(screenPaint);
+  screenPaint->endFrame();
+  // include dirtyCount in output file as a check on undo system
+  int dirtycount = scribbleDoc->document->dirtyCount;
+  for(unsigned int pp = 0; pp < scribbleDoc->document->pages.size(); pp++)
+    dirtycount += scribbleDoc->document->pages[pp]->dirtyCount;
+  scribbleDoc->cfg->set("test_dirtyCount", dirtycount);
+  if(!scribbleDoc->saveDocument(outfile.c_str()))
+    SCRIBBLE_LOG("ScribbleTest: error saving %s", outfile.c_str());
+}
+
 // a bunch of integration tests ... any "*_out.html" files present after test indicate a failure
 // TODO: add some tests to capture scribbleArea->imgPaint->image and compare to a ref
 
@@ -247,20 +287,7 @@ void ScribbleTest::runAll(bool runsynctest)
       scribbleDoc->saveDocument((basefile + "_new.html").c_str());
 #endif
 
-    scribbleDoc->newDocument();
-    // attempt to open input file; fails quietly if not present
-    Document::loadresult_t res = scribbleDoc->openDocument((basefile + "_in.html").c_str());
-    if(res == Document::LOAD_NONFATAL) {
-      scribbleDoc->checkAndClearErrors();
-      scribbleDoc->cfg->set("test_loadErrors", true);
-    }
-    // reset mode
-    scribbleMode->setRuled(true);
-    scribbleMode->setMode(MODE_STROKE);
-    scribbleDoc->app->setPen(ScribblePen(Color::BLACK, 1, ScribblePen::TIP_ROUND));
-    scribbleDoc->app->bookmarkColor = Color::BLUE;
-    // prevent unintended updates while inspecting:
-    scribbleDoc->cfg->set("savePrompt", true);
+    setupTest(basefile + "_in.html");
 
     if(syncSlave) {
       // wait for slave to finish previous test
@@ -286,8 +313,13 @@ void ScribbleTest::runAll(bool runsynctest)
     else if(ii >= nonsynctests)
       break;
 
+    // WRITE_RECORD_DIR: write each test's actions to <dir>/test<N>.trace in the replay grammar
+    const char* recdir = getenv("WRITE_RECORD_DIR");
+    if(recdir && !syncSlave)
+      startRecording(fstring("%s/test%d.trace", recdir, ii));
     // array of pointers to member functions, wow...
     (this->*tests[ii])();
+    stopRecording();
 
     // when running sync test, slave writes output
     if(syncSlave) {
@@ -296,25 +328,9 @@ void ScribbleTest::runAll(bool runsynctest)
       continue;
     }
 
-    // distribute transform to stroke points to match old behavior ... remove this later(?)
-    distributeTransform(scribbleDoc->document);
-    //screenPaint->beginFrame();
-    //bookmarkArea->doPaintEvent(screenPaint);
-    //screenPaint->endFrame();
-    screenPaint->beginFrame();
-    scribbleArea->doPaintEvent(screenPaint);
-    screenPaint->endFrame();
-    // We haven't looked the png output in ages, so stop generating for now
-    //screenImg->save(basefile + "_out.png", "png");
-    // include dirtyCount in output file as a check on undo system
-    int dirtycount = scribbleDoc->document->dirtyCount;
-    for(unsigned int pp = 0; pp < scribbleDoc->document->pages.size(); pp++)
-      dirtycount += scribbleDoc->document->pages[pp]->dirtyCount;
-    scribbleDoc->cfg->set("test_dirtyCount", dirtycount);
     // write output file
     std::string outfile = basefile + "_out.html";
-    if(!scribbleDoc->saveDocument(outfile.c_str()))
-      SCRIBBLE_LOG("ScribbleTest: error saving %s", outfile.c_str());
+    saveTestOutput(outfile);
     // compare output to reference; tests of one-file-per-page must handle the svg files themselves
     // we've had so many problems with thumbnails that we will count mismatches of those separately
     if(testCompareFiles(outfile.c_str(), (basefile + "_ref.html").c_str()))
@@ -361,9 +377,9 @@ void ScribbleTest::runAll(bool runsynctest)
 
 void ScribbleTest::performanceTest()
 {
-  scribbleArea->gotoPos(0, Point(0,0));
-  scribbleMode->setMode(MODE_STROKE);
-  scribbleDoc->app->setPen(ScribblePen(Color::BLACK, 1, ScribblePen::TIP_FLAT | ScribblePen::WIDTH_PR, 1.0, 2.0));
+  gotoPos(0, Point(0,0));
+  setMode(MODE_STROKE);
+  setPen(ScribblePen(Color::BLACK, 1, ScribblePen::TIP_FLAT | ScribblePen::WIDTH_PR, 1.0, 2.0));
   scribbleArea->frameCount = 0;
   Timestamp t0 = mSecSinceEpoch();
 
@@ -407,7 +423,7 @@ void ScribbleTest::performanceTest()
   int moveFrames = scribbleArea->frameCount;
   scribbleArea->frameCount = 0;
   // scroll up and down a bunch
-  scribbleMode->setMode(MODE_PAN);
+  setMode(MODE_PAN);
   ie(400, 800, 0, pen, press);
   for(int ii = 0; ii < 2000; ii++) {
     // cleverly generate a triangle wave
@@ -506,7 +522,13 @@ void ScribbleTest::mtinput(inputevent_t ev1, Dim x1, Dim y1, inputevent_t ev2, D
     ievent.points.push_back(InputPoint(ev1, x1, y1, 1));  // pressure = 1
   if(ev2 != INPUTEVENT_NONE)
     ievent.points.push_back(InputPoint(ev2, x2, y2, 1));
+  // touch gestures act on the view, so "mt" keeps screen coordinates; the ie logger must not also see them
+  record("mt %d %s %s %d %s %s", int(ev1), ScribbleInput::traceReal(x1).c_str(), ScribbleInput::traceReal(y1).c_str(),
+      int(ev2), ScribbleInput::traceReal(x2).c_str(), ScribbleInput::traceReal(y2).c_str());
+  FILE* log = ScribbleInput::traceLog;
+  ScribbleInput::traceLog = NULL;
   scribbleArea->scribbleInput->doInputEvent(ievent);
+  ScribbleInput::traceLog = log;
 }
 
 // draw a simple stroke
@@ -539,12 +561,12 @@ void ScribbleTest::s2(Dim xoffset, Dim yoffset)
 void ScribbleTest::f2(Dim xoffset, Dim yoffset)
 {
   ScribblePen oldpen = *scribbleDoc->app->getPen();
-  scribbleDoc->app->setPen(ScribblePen(Color::BLACK, 1.2, ScribblePen::TIP_FLAT | ScribblePen::WIDTH_PR, 1.0, 2.0));
+  setPen(ScribblePen(Color::BLACK, 1.2, ScribblePen::TIP_FLAT | ScribblePen::WIDTH_PR, 1.0, 2.0));
   ie(10 + xoffset, -14.8 + yoffset, 0.3, pen, press);
   ie(-9.9 + xoffset, 0.1 + yoffset, 0.7, pen);
   ie(9.8 + xoffset, 15.1 + yoffset, 0.5, pen);
   ie(0, 0, 0, pen, release);
-  scribbleDoc->app->setPen(oldpen);
+  setPen(oldpen);
 }
 
 // MultiStroke (HyperRef) consisting of two strokes
@@ -560,14 +582,14 @@ void ScribbleTest::hr(Dim xoffset, Dim yoffset)
   ie(-9.8 + 10 + xoffset, 12.4 + yoffset, 0, pen);
   ie(0, 0, 0, pen, release);
 
-  scribbleMode->setMode(MODE_SELECTRECT);
+  setMode(MODE_SELECTRECT);
   ie(-12 + xoffset, -17 + yoffset, 0, pen, press);
   ie(xoffset, yoffset, 0, pen);
   ie(22 + xoffset, 17 + yoffset, 0, pen);
   ie(0, 0, 0, pen, release);
-  scribbleArea->createHyperRef("http://www.styluslabs.com");
+  createHyperRef("http://www.styluslabs.com");
   // have to clear the selection ourselves now
-  scribbleArea->clearSelection();
+  clearSelection();
 }
 
 void ScribbleTest::s3()
@@ -636,13 +658,13 @@ void ScribbleTest::s4()
 
 void ScribbleTest::test0()
 {
-  //scribbleArea->gotoPos(0, Point(0,0));
+  //gotoPos(0, Point(0,0));
   ie(104.4, 184.4, 0, pen, press);
   ie(124.5, 162.2, 0, pen);
   ie(131.8, 167.3, 0, pen);
   ie(0, 0, 0, pen, release);
 
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(14.4, 56.4, 0, pen, press);
   ie(16.5, 85.2, 0, pen);
   ie(16.5, 99.9, 0, pen);
@@ -682,7 +704,7 @@ void ScribbleTest::test1()
   ie(121.8, 177.3, 0, pen);
   ie(0, 0, 0, pen, release);
 
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(14.4, 56.4, 0, pen, press);
   ie(16.5, 86.2, 0, pen);
   ie(15.8, 113.3, 0, pen);
@@ -810,7 +832,7 @@ void ScribbleTest::test4()
 
   doCommand(ID_NEXTPAGE);  // make sure we're on second page
   //doCommand(ID_PASTE);
-  scribbleMode->setMode(MODE_PAGESEL);
+  setMode(MODE_PAGESEL);
   // tap on page
   ie(300, 400, 0, pen, press);
   ie(301, 399, 0, pen);
@@ -820,7 +842,7 @@ void ScribbleTest::test4()
   doCommand(ID_NEXTSCREEN);  // want to paste after first page
   doCommand(ID_PASTE);
   doCommand(ID_PASTE);
-  scribbleArea->gotoPage(0);  // restore view
+  gotoPage(0);  // restore view
 }
 
 // test setting page properties and growing page
@@ -829,7 +851,7 @@ void ScribbleTest::test5()
   PageProperties props(600, 800, 30, 30, 30, Color::YELLOW, Color(0, 0, 0xFF, 0x7F));
   ss(0);
   ss(10);
-  scribbleDoc->setPageProperties(&props, false, true, false);
+  setPageProperties(&props, false, true, false);
   ss(20);
   // add new page
   doCommand(ID_NEXTPAGENEW);
@@ -839,7 +861,7 @@ void ScribbleTest::test5()
   ie(124.5, 803, 0, pen);
   ie(131.8, 900, 0, pen);
   ie(0, 0, 0, pen, release);
-  scribbleArea->recentStrokeSelect();
+  recentStrokeSelect();
   doCommand(ID_DELSEL);
   ss(20);
 }
@@ -848,7 +870,7 @@ void ScribbleTest::test5()
 void ScribbleTest::test6()
 {
   // make a lasso selection
-  scribbleMode->setMode(MODE_SELECTLASSO);
+  setMode(MODE_SELECTLASSO);
   ie(475.000, 199.000, 0.000, 1, 1, 0);
   ie(450.000, 175.000, 0.000, 1, 0, 0);
   ie(329.000, 269.000, 0.000, 1, 0, 0);
@@ -878,7 +900,7 @@ void ScribbleTest::test6()
   // tests added for dup sel (and for resaving page containing jpeg image)
   doCommand(ID_NEXTPAGE);
   // ruled select in left margin
-  scribbleMode->setMode(MODE_SELECTRULED);
+  setMode(MODE_SELECTRULED);
   ie(24, 61, 0, pen, press);
   ie(23, 139, 0, pen);
   ie(0, 0, 0, pen, release);
@@ -890,9 +912,9 @@ void ScribbleTest::test6()
 void ScribbleTest::test7()
 {
   // easier to figure out what's going on if screen space and Dim space are the same
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   PageProperties props(700, 800, 0, 40, 100);
-  scribbleDoc->setPageProperties(&props, false, true, false);
+  setPageProperties(&props, false, true, false);
   // create 3 lines of "text";  note: width of ss is 27.4
   for(int offset = 15; offset < 500; offset += 139) {
     s1(offset, 0);
@@ -913,14 +935,14 @@ void ScribbleTest::test7()
     s1(offset + 90, 80);
   }
   // insert space on first line
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(102, 180, 0, pen, press);
   ie(200, 180, 0, pen);
   ie(310, 180, 0, pen);
   ie(0, 0, 0, pen, release);
 
   // insert some more space, then undo
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(102, 180, 0, pen, press);
   ie(200, 180, 0, pen);
   ie(310, 180, 0, pen);
@@ -932,7 +954,7 @@ void ScribbleTest::test7()
   s1(30, 280);
   s1(60, 280);
   s1(90, 280);
-  scribbleMode->setMode(MODE_INSSPACEVERT);
+  setMode(MODE_INSSPACEVERT);
   ie(102, 420, 0, pen, press);
   ie(103, 440, 0, pen);
   ie(105, 470, 0, pen);
@@ -943,11 +965,11 @@ void ScribbleTest::test7()
 void ScribbleTest::test8()
 {
   PageProperties props(700, 800, 0, 40, 100);
-  scribbleDoc->setPageProperties(&props, false, true, false);
+  setPageProperties(&props, false, true, false);
   // add new page
   s2(400,60);
   doCommand(ID_NEXTPAGENEW);
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   doCommand(ID_SELALL);
   doCommand(ID_DELSEL);
   s2(200, 380);
@@ -956,38 +978,38 @@ void ScribbleTest::test8()
   f2(250, 420);
   s2(600, 420);
   s2(200, 460);
-  scribbleMode->setMode(MODE_SELECTRULED);
+  setMode(MODE_SELECTRULED);
   ie(110, 420, 0, pen, press);
   ie(275, 420, 0, pen);
   ie(350, 420, 0, pen);
   ie(0, 0, 0, pen, release);
   // hack to workaround new behavior that dropping selection outside screen area will not move
-  scribbleArea->screenRect = Rect::ltwh(0, 0, 600, 1400);
+  setScreenRect(Rect::ltwh(0, 0, 600, 1400));
   // drag selection to second page
   ie(200, 420, 0, pen, press);
   ie(210, 750, 0, pen);
   ie(215, 1300 - 40, 0, pen);  // -40 accounts for change of interpage gap from 60 to 20
   ie(0, 0, 0, pen, release);
-  scribbleArea->screenRect = screenRect;
+  setScreenRect(screenRect);
   // put pen down to clear selection
   s2(500, 1300);
 
   // return to first page and test erasers
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   s2(200, 60);
   s2(150, 100);
   s2(200, 100);
   s2(250, 100);
   s2(600, 100);
   s2(200, 140);
-  scribbleMode->setMode(MODE_ERASERULED);
+  setMode(MODE_ERASERULED);
   ie(110, 100, 0, pen, press);
   ie(150, 100, 0, pen);
   ie(200, 100, 0, pen);
   ie(250, 130, 0, pen);
   ie(150, 130, 0, pen);
   ie(0, 0, 0, pen, release);
-  scribbleMode->setMode(MODE_ERASESTROKE);
+  setMode(MODE_ERASESTROKE);
   ie(599, 62, 0, pen, press);
   ie(600, 100, 0, pen);
   ie(602, 139, 0, pen);
@@ -997,9 +1019,9 @@ void ScribbleTest::test8()
 // test ruled mode tools on unruled page
 void ScribbleTest::test9()
 {
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   PageProperties props(700, 800, 0, 0, 0);
-  scribbleDoc->setPageProperties(&props, false, true, false);
+  setPageProperties(&props, false, true, false);
   // create 4 lines of "text"
   for(int offset = 125; offset < 600; offset += 125) {
     s2(offset, 41);
@@ -1026,19 +1048,19 @@ void ScribbleTest::test9()
     s2(offset + 76, 159);
   }
   // add a bookmark
-  scribbleMode->setMode(MODE_BOOKMARK);
+  setMode(MODE_BOOKMARK);
   ie(135, 110, 0, pen, press);
   ie(106, 140, 0, pen);
   ie(60, 160, 0, pen);
   ie(0, 0, 0, pen, release);
   // insert space
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(235, 110, 0, pen, press);
   ie(206, 140, 0, pen);
   ie(184, 195, 0, pen);
   ie(0, 0, 0, pen, release);
   // ruled erase
-  scribbleMode->setMode(MODE_ERASERULED);
+  setMode(MODE_ERASERULED);
   ie(60, 90, 0, pen, press);
   ie(140, 92, 0, pen);
   ie(200, 87, 0, pen);
@@ -1047,7 +1069,7 @@ void ScribbleTest::test9()
   ie(0, 0, 0, pen, release);
 
   // drop a bookmark off page, then undo - added because this used to cause crash on undo
-  scribbleMode->setMode(MODE_BOOKMARK);
+  setMode(MODE_BOOKMARK);
   ie(50, 50, 0, pen, press);
   ie(20, 20, 0, pen);
   ie(-100, -100, 0, pen);
@@ -1057,18 +1079,18 @@ void ScribbleTest::test9()
 
   // must refresh bookmarks so that findBookmark will work
   //bookmarkArea->repaintBookmarks();
-  screenPaint->beginFrame();  bookmarkArea->doPaintEvent(screenPaint);  screenPaint->endFrame();
+  paintBookmarks();
 
   doCommand(ID_NEXTPAGENEW);
-  scribbleArea->gotoPos(1, Point(-10,-10));  // account for previous behavior of NEXTPAGE
+  gotoPos(1, Point(-10,-10));  // account for previous behavior of NEXTPAGE
   // create hyperref, then convert (along with another stroke) to point to bookmark on first page
   hr(150, 100);
   s2(200, 100);
   doCommand(ID_SELALL);
-  scribbleArea->createHyperRef(bookmarkArea->findBookmark(scribbleDoc->document, 20));
+  createHyperRefToBookmark(20);
 
   // add bookmark to 2nd page ... id should not be serialized for this one
-  scribbleMode->setMode(MODE_BOOKMARK);
+  setMode(MODE_BOOKMARK);
   ie(135, 150, 0, pen, press);
   ie(106, 180, 0, pen);
   ie(65, 200, 0, pen);
@@ -1092,27 +1114,27 @@ void ScribbleTest::test10()
 {
   // test creating new doc with different view modes (added because of crash)
   if(!syncSlave) {
-    scribbleConfig->set("viewMode", 0);
-    scribbleDoc->newDocument();
-    scribbleConfig->set("viewMode", 2);
-    scribbleDoc->newDocument();
-    scribbleConfig->set("viewMode", 1);
-    scribbleDoc->newDocument();
+    cfgSet("viewMode", 0);
+    newDocument();
+    cfgSet("viewMode", 2);
+    newDocument();
+    cfgSet("viewMode", 1);
+    newDocument();
   }
 
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   hr(150, 100);
   s2(200, 100);
   f2(250, 100);
   doCommand(ID_SELALL);
 
-  scribbleDoc->activeArea->setStrokeProperties(StrokeProperties(Color::BLUE, -1));
-  scribbleDoc->activeArea->setStrokeProperties(StrokeProperties(Color::INVALID_COLOR, 2));
-  scribbleDoc->activeArea->setStrokeProperties(StrokeProperties(Color::INVALID_COLOR, 3));
+  setStrokeProperties(StrokeProperties(Color::BLUE, -1));
+  setStrokeProperties(StrokeProperties(Color::INVALID_COLOR, 2));
+  setStrokeProperties(StrokeProperties(Color::INVALID_COLOR, 3));
   undo();
 
   // added due to bug: failed to create undo items for translated multistrokes
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(104, 100, 0, pen, press);
   ie(195, 98, 0, pen);
   ie(244, 103, 0, pen);
@@ -1120,7 +1142,7 @@ void ScribbleTest::test10()
   undo();
 
   // Note pen not longer changed when selection active
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(104, 100, 0, pen, press);
   ie(195, 98, 0, pen);
   ie(298, 103, 0, pen);
@@ -1130,9 +1152,9 @@ void ScribbleTest::test10()
 // test column detection and free erase
 void ScribbleTest::test11()
 {
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   PageProperties props(1200, 800, 0, 40, 100);
-  scribbleDoc->setPageProperties(&props, false, true, false);
+  setPageProperties(&props, false, true, false);
   // create 2 columns with 4 lines of "text" each
   for(int col = 0; col < 1000; col += 550) {
     for(int offset = 125; offset < 600; offset += 125) {
@@ -1168,7 +1190,7 @@ void ScribbleTest::test11()
   ie(0, 0, 0, pen, release);
 
   // insert space
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(225, 62, 0, pen, press);
   ie(350, 64, 0, pen);
   ie(505, 63, 0, pen);
@@ -1185,7 +1207,7 @@ void ScribbleTest::test11()
   s2(200, 379);
   f2(250, 382);
   hr(300, 381);
-  scribbleMode->setMode(MODE_ERASEFREE);
+  setMode(MODE_ERASEFREE);
   ie(100, 380, 0, pen, press);
   ie(140, 380, 0, pen);
   ie(200, 380, 0, pen);
@@ -1199,15 +1221,15 @@ void ScribbleTest::test11()
 void ScribbleTest::test12()
 {
   // easier to figure out what's going on if screen space and Dim space are the same
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   // test added because of crash
-  scribbleMode->setMode(MODE_BOOKMARK);
+  setMode(MODE_BOOKMARK);
   ie(135, 110, 0, pen, press);
   ie(106, 100, 0, pen);
   ie(60, 60, 0, pen);
   ie(0, 0, 0, pen, release);
   //scribbleDoc->document->drawBookmarks(screenPaint, Rect());
-  screenPaint->beginFrame();  bookmarkArea->doPaintEvent(screenPaint);  screenPaint->endFrame();
+  paintBookmarks();
   undo();
   // back to our regularly scheduled programming...
   s2(200, 179);
@@ -1228,7 +1250,7 @@ void ScribbleTest::test12()
   doCommand(ID_UNDO);
   doCommand(ID_REDO);
   // apply free eraser to image
-  scribbleMode->setMode(MODE_ERASEFREE);
+  setMode(MODE_ERASEFREE);
   ie(100, 40, 0, pen, press);
   ie(150, 90, 0, pen);
   ie(200, 140, 0, pen);
@@ -1244,15 +1266,15 @@ void ScribbleTest::test13()
   const char* filename = sfilename.c_str();
 
   // create page 1
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   s2(100, 100);
   // create page 2
   doCommand(ID_NEXTPAGENEW);
-  scribbleArea->gotoPos(1, Point(-10,-10));  // account for previous behavior of NEXTPAGE
+  gotoPos(1, Point(-10,-10));  // account for previous behavior of NEXTPAGE
   s2(200, 200);
   // create page 3
   doCommand(ID_NEXTPAGENEW);
-  scribbleArea->gotoPos(2, Point(-10,-10));  // account for previous behavior of NEXTPAGE
+  gotoPos(2, Point(-10,-10));  // account for previous behavior of NEXTPAGE
   s2(300, 300);
   // undo and redo page creation ... added because of a crash
   doCommand(ID_UNDO);
@@ -1260,68 +1282,47 @@ void ScribbleTest::test13()
   doCommand(ID_REDO);
   doCommand(ID_REDO);
   // return to page 1
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   // save
   if(!syncSlave) {
     //scribbleArea->cfg->set("singleFile", false);
-    scribbleDoc->saveDocument(filename, Document::SAVE_MULTIFILE);
+    reopen(filename, Document::SAVE_MULTIFILE, false);
     // reopen; only page 1 should be loaded
-    scribbleDoc->openDocument(filename);
   }
 
   // change page properties - apply to all
   PageProperties props(0, 0, 30, 30, 30, Color::YELLOW, Color(0, 0, 0xFF, 0x7F));
-  scribbleDoc->setPageProperties(&props, true, false, false);
+  setPageProperties(&props, true, false, false);
   // save and reopen
-  if(!syncSlave) {
-    scribbleDoc->saveDocument(filename);
-    scribbleDoc->openDocument(filename);
-  }
+  if(!syncSlave)
+    reopen(filename, 0, false);
 
   // insert a new page after page 1
   doCommand(ID_PAGEAFTER);
-  scribbleArea->gotoPos(1, Point(-10,-10));  // account for previous behavior of NEXTPAGE
+  gotoPos(1, Point(-10,-10));  // account for previous behavior of NEXTPAGE
   s2(150, 150);
   // save and reopen
-  if(!syncSlave) {
-    scribbleDoc->saveDocument(filename);
-    scribbleDoc->openDocument(filename);
-  }
+  if(!syncSlave)
+    reopen(filename, 0, false);
 
   // remove page 3 (formerly page 2)
   doCommand(ID_NEXTPAGENEW);
   doCommand(ID_DELPAGE);
   // save and reopen
   if(!syncSlave) {
-    scribbleDoc->saveDocument(filename);
-    scribbleDoc->openDocument(filename);
     // load all pages before deleting SVG files
-    scribbleDoc->document->ensurePagesLoaded();
-    // return to single file config for comparision of file result
-    //scribbleArea->cfg->set("singleFile", true);
-    // remove SVG files
-    scribbleDoc->document->deleteFiles();   //ScribbleDoc::deleteDocument(filename);
-
+    reopen(filename, 0, true);
     // test other file types
-    std::string svgfile = outPath + u8"/test13_\u4E0B\u5348.svg";
-    scribbleDoc->saveDocument(svgfile.c_str());
-    scribbleDoc->openDocument(svgfile.c_str());
-    scribbleDoc->document->ensurePagesLoaded();
-    scribbleDoc->document->deleteFiles();   //ScribbleDoc::deleteDocument(svgfile.c_str());
-
-    std::string svgzfile = outPath + u8"/test13_\u4E0B\u5348.svgz";
-    scribbleDoc->saveDocument(svgzfile.c_str());
-    scribbleDoc->openDocument(svgzfile.c_str());
-    scribbleDoc->document->ensurePagesLoaded();
-    scribbleDoc->document->deleteFiles();   //ScribbleDoc::deleteDocument(svgzfile.c_str());
+    reopen(outPath + u8"/test13_\u4E0B\u5348.svg", 0, true);
+    reopen(outPath + u8"/test13_\u4E0B\u5348.svgz", 0, true);
   }
 }
 
 void ScribbleTest::test14()
 {
-  scribbleMode->moveSelMode = MODE_MOVESELFREE;  // selectAll no longer ignores moveSelMode
+  setMoveSelMode(MODE_MOVESELFREE);  // selectAll no longer ignores moveSelMode
   // easier to figure out what's going on if screen space and Dim space are the same
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
 
   s2(200, 179);
   f2(250, 182);
@@ -1350,22 +1351,22 @@ void ScribbleTest::test14()
   doCommand(ID_REDO);
 
   // test smoothing and simplification
-  scribbleDoc->app->setPen(ScribblePen(Color::BLACK, 1.2, ScribblePen::TIP_FLAT | ScribblePen::WIDTH_PR, 1.0, 2.0));
-  scribbleDoc->cfg->set("inputSimplify", 4);
+  setPen(ScribblePen(Color::BLACK, 1.2, ScribblePen::TIP_FLAT | ScribblePen::WIDTH_PR, 1.0, 2.0));
+  cfgSet("inputSimplify", 4);
   s3();
-  scribbleDoc->cfg->set("inputSmoothing", 4);
+  cfgSet("inputSmoothing", 4);
   s4();
-  scribbleDoc->cfg->set("inputSmoothing", 0);
-  scribbleDoc->cfg->set("inputSimplify", 0);
+  cfgSet("inputSmoothing", 0);
+  cfgSet("inputSimplify", 0);
 }
 
 // add snap to grid and line drawing tests too!
 void ScribbleTest::test15()
 {
   // switch to relative path data
-  SvgWriter::DEFAULT_PATH_DATA_REL = true;
+  setPathDataRel(true);
 
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   s2(200, 179);
   f2(250, 182);
   hr(300, 181);
@@ -1377,20 +1378,20 @@ void ScribbleTest::test15()
   ie(0, 0, 0, pen, release);
 
   // test z-order for highlighter (draw under)
-  scribbleDoc->app->setPen(ScribblePen(Color::YELLOW, 20, ScribblePen::TIP_CHISEL | ScribblePen::DRAW_UNDER));
+  setPen(ScribblePen(Color::YELLOW, 20, ScribblePen::TIP_CHISEL | ScribblePen::DRAW_UNDER));
   s2(250, 190);
   undo();
   redo();
 
   s2(310, 180);
-  scribbleMode->setMode(MODE_ERASESTROKE);
+  setMode(MODE_ERASESTROKE);
   ie(300, 180, 0, pen, press);
   ie(300, 180, 0, pen);
   ie(0, 0, 0, pen, release);
   undo();
 
   // test of reflow that should fail w/ cmpRuled bug (not sorting strokes on line left-to-right)
-  scribbleDoc->app->setPen(ScribblePen(Color::BLACK, 1, ScribblePen::TIP_ROUND));
+  setPen(ScribblePen(Color::BLACK, 1, ScribblePen::TIP_ROUND));
   for(int offset = 15; offset < 500; offset += 139) {
     s1(offset + 60, 120);
     s1(offset + 90, 120);
@@ -1398,7 +1399,7 @@ void ScribbleTest::test15()
     s1(offset + 30, 120);
   }
   // insert space
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(102, 300, 0, pen, press);
   ie(200, 300, 0, pen);
   ie(310, 300, 0, pen);
@@ -1410,18 +1411,15 @@ void ScribbleTest::test15()
   s2(180,      420);
   s2(180 + 30, 420);
 
-  scribbleMode->setMode(MODE_INSSPACERULED);
+  setMode(MODE_INSSPACERULED);
   ie(180 + 45, 420, 0, pen, press);
   ie(180, 420, 0, pen);
   ie(140, 420, 0, pen);
   ie(0, 0, 0, pen, release);
 
-  SvgDocument* svgDoc = SvgParser().parseFragment(
+  setClipboardSvg(
       "<g stroke='green' transform='translate(50, 50)'><rect fill='rgba(0, 0, 255, 0.8)' stroke='none' x='0' y='0' width='20' height='20'/>"
       "<path fill='red' d='M10 10 l2 4 1 2 0 3 -1 1 -1 0z'/></g>");
-  Clipboard* clip = scribbleDoc->app->importExternalDoc(svgDoc);
-  scribbleDoc->app->clipboard.reset(clip);
-  scribbleDoc->app->clipboardPage = NULL;
 
   doCommand(ID_PASTE);
   doCommand(ID_DELSEL);
@@ -1443,7 +1441,7 @@ void ScribbleTest::waitForSync()
 
 void ScribbleTest::synctest01()
 {
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   hr(150, 100);
   s2(200, 100);
   f2(250, 100);
@@ -1464,10 +1462,10 @@ void ScribbleTest::synctest01()
 
 void ScribbleTest::synctest01slave1()
 {
-  scribbleArea->gotoPos(0, Point(0,0));
+  gotoPos(0, Point(0,0));
   s2(550, 550);
   // apply free eraser to image
-  scribbleMode->setMode(MODE_ERASERULED);
+  setMode(MODE_ERASERULED);
   ie(245, 101, 0, pen, press);
   ie(270, 99, 0, pen);
   ie(300, 100, 0, pen);
@@ -1484,4 +1482,491 @@ void ScribbleTest::synctest01slave2()
   // wait for connection
   while(!scribbleDoc->scribbleSync->isSyncActive())
     ScribbleApp::processEvents();
+}
+
+// Trace recording and replay for dzackgarza/math-notes-app tests/fixtures/write (see README.md there).
+// The grammar is the set of actions the tests above perform: each helper writes one line, then acts, so that
+//  recording runAll (WRITE_RECORD_DIR) converts each test to a trace, and replaying a trace from the same
+//  setup reproduces the test's *_ref.html.  Input coordinates come from ScribbleInput::traceLog.
+
+void ScribbleTest::startRecording(const std::string& path)
+{
+  ScribbleInput::traceLog = fopen(path.c_str(), "w");
+  // the view at test start, as gotoPos arguments: the replayed test then sees the same screen
+  Point pos = scribbleArea->dimToPageDim(scribbleArea->screenToDim(Point(0,0)));
+  record("view %d %s %s", scribbleArea->currPageNum, ScribbleInput::traceReal(pos.x).c_str(),
+      ScribbleInput::traceReal(pos.y).c_str());
+}
+
+void ScribbleTest::stopRecording()
+{
+  if(ScribbleInput::traceLog)
+    fclose(ScribbleInput::traceLog);
+  ScribbleInput::traceLog = NULL;
+}
+
+void ScribbleTest::record(const char* fmt, ...)
+{
+  if(!ScribbleInput::traceLog)
+    return;
+  va_list args;
+  va_start(args, fmt);
+  vfprintf(ScribbleInput::traceLog, fmt, args);
+  va_end(args);
+  fputc('\n', ScribbleInput::traceLog);
+}
+
+static std::string R(double x) { return ScribbleInput::traceReal(x); }
+
+void ScribbleTest::setMode(int mode)
+{
+  record("mode %d", mode);
+  scribbleMode->setMode(mode);
+}
+
+void ScribbleTest::setPen(const ScribblePen& p)
+{
+  record("pen %u %s %u %s %s %s %s %s %s", p.color.argb(), R(p.width).c_str(), p.flags, R(p.wRatio).c_str(),
+      R(p.prParam).c_str(), R(p.spdMax).c_str(), R(p.dirAngle).c_str(), R(p.dash).c_str(), R(p.gap).c_str());
+  scribbleDoc->app->setPen(p);
+}
+
+void ScribbleTest::setPageProperties(const PageProperties* p, bool applytoall, bool docdefault, bool global)
+{
+  record("props %s %s %s %s %s %u %u %d %d %d", R(p->width).c_str(), R(p->height).c_str(), R(p->xRuling).c_str(),
+      R(p->yRuling).c_str(), R(p->marginLeft).c_str(), p->color.argb(), p->ruleColor.argb(),
+      int(applytoall), int(docdefault), int(global));
+  scribbleDoc->setPageProperties(p, applytoall, docdefault, global);
+}
+
+void ScribbleTest::gotoPos(int pagenum, Point pos)
+{
+  record("view %d %s %s", pagenum, R(pos.x).c_str(), R(pos.y).c_str());
+  scribbleArea->gotoPos(pagenum, pos);
+}
+
+void ScribbleTest::gotoPage(int pagenum)
+{
+  record("page %d", pagenum);
+  scribbleArea->gotoPage(pagenum);
+}
+
+void ScribbleTest::setScreenRect(const Rect& r)
+{
+  record("screen %s %s %s %s", R(r.left).c_str(), R(r.top).c_str(), R(r.width()).c_str(), R(r.height()).c_str());
+  scribbleArea->screenRect = r;
+}
+
+void ScribbleTest::createHyperRef(const char* url)
+{
+  record("hyperref %s", url);
+  scribbleArea->createHyperRef(url);
+}
+
+void ScribbleTest::createHyperRefToBookmark(Dim bookmarky)
+{
+  record("hyperref-bookmark %s", R(bookmarky).c_str());
+  scribbleArea->createHyperRef(bookmarkArea->findBookmark(scribbleDoc->document, bookmarky));
+}
+
+void ScribbleTest::clearSelection()
+{
+  record("clearsel");
+  scribbleArea->clearSelection();
+}
+
+void ScribbleTest::recentStrokeSelect()
+{
+  record("recentsel");
+  scribbleArea->recentStrokeSelect();
+}
+
+// bookmarks must be painted before findBookmark can find them
+void ScribbleTest::paintBookmarks()
+{
+  record("paintbookmarks");
+  screenPaint->beginFrame();
+  bookmarkArea->doPaintEvent(screenPaint);
+  screenPaint->endFrame();
+}
+
+void ScribbleTest::setStrokeProperties(const StrokeProperties& props)
+{
+  record("strokeprops %u %s", props.color.argb(), R(props.width).c_str());
+  scribbleArea->setStrokeProperties(props);
+}
+
+void ScribbleTest::setMoveSelMode(int mode)
+{
+  record("selmode %d", mode);
+  scribbleMode->moveSelMode = mode;
+}
+
+void ScribbleTest::setPathDataRel(bool rel)
+{
+  record("pathrel %d", int(rel));
+  SvgWriter::DEFAULT_PATH_DATA_REL = rel;
+}
+
+void ScribbleTest::setClipboardSvg(const char* svg)
+{
+  record("clipsvg %s", svg);
+  SvgDocument* svgDoc = SvgParser().parseFragment(svg);
+  Clipboard* clip = scribbleDoc->app->importExternalDoc(svgDoc);
+  scribbleDoc->app->clipboard.reset(clip);
+  scribbleDoc->app->clipboardPage = NULL;
+}
+
+void ScribbleTest::newDocument()
+{
+  record("newdoc");
+  scribbleDoc->newDocument();
+}
+
+// save to path, then open it again; with loadall, load every page and delete the saved files
+void ScribbleTest::reopen(const std::string& path, int saveflags, bool loadall)
+{
+  std::string ext = path.substr(path.find_last_of('.') + 1);
+  record("reopen %s %d %d", ext.c_str(), saveflags, int(loadall));
+  scribbleDoc->saveDocument(path.c_str(), Document::saveflags_t(saveflags));
+  scribbleDoc->openDocument(path.c_str());
+  if(loadall) {
+    scribbleDoc->document->ensurePagesLoaded();
+    scribbleDoc->document->deleteFiles();
+  }
+}
+
+// replay
+
+// Elements get ids in order of first appearance: input.html's elements in document order, then each element
+//  as it appears after a trace line.  An element keeps its id while it is in the document, and on returning
+//  (undo) if its bounds are unchanged; a new Element at the address of a freed one gets a new id.
+struct ReplayIds
+{
+  struct Rec { int id; Rect bbox; };
+  std::map<Element*, Rec> recs;
+  std::set<int> live;
+  int nextId = 0;
+
+  void visit(Element* e, const std::set<int>& prevLive)
+  {
+    auto it = recs.find(e);
+    if(it == recs.end() || (!prevLive.count(it->second.id) && it->second.bbox != e->bbox())) {
+      recs[e] = Rec{nextId++, e->bbox()};
+      it = recs.find(e);
+    }
+    it->second.bbox = e->bbox();
+    live.insert(it->second.id);
+    if(e->isMultiStroke()) {
+      for(Element* c : e->children())
+        visit(c, prevLive);
+    }
+  }
+
+  void snapshot(Document* doc)
+  {
+    std::set<int> prevLive;
+    prevLive.swap(live);
+    for(Page* page : doc->pages) {
+      if(page->loadStatus != Page::LOAD_OK)
+        continue;
+      for(Element* e : page->children())
+        visit(e, prevLive);
+    }
+  }
+};
+
+static Timestamp replayTime = 0;
+static Timestamp replayClock() { return replayTime; }
+
+static std::vector<std::string> splitWords(const std::string& s, size_t n)
+{
+  // first n-1 whitespace separated words, then the rest of the line
+  std::vector<std::string> w;
+  size_t pos = 0;
+  while(pos < s.size() && w.size() + 1 < n) {
+    size_t start = s.find_first_not_of(" \t", pos);
+    if(start == std::string::npos) break;
+    size_t end = s.find_first_of(" \t", start);
+    w.push_back(s.substr(start, end == std::string::npos ? std::string::npos : end - start));
+    pos = end == std::string::npos ? s.size() : end;
+  }
+  size_t rest = s.find_first_not_of(" \t", pos);
+  if(rest != std::string::npos)
+    w.push_back(s.substr(rest));
+  return w;
+}
+
+bool ScribbleTest::replayLine(const std::string& line, const std::string& casedir)
+{
+  std::istringstream in(line);
+  std::string op;
+  in >> op;
+  if(op.empty() || op[0] == '#')
+    return true;
+  if(op == "ie") {
+    // scribbletest.cpp ie() at styluslabs/Write 401b65d, with (x, y) given relative to page 0 and t explicit
+    Dim x, y, p;  int src, ev, mm;  long long t;
+    if(!(in >> x >> y >> p >> src >> ev >> mm >> t)) return false;
+    Point s = scribbleArea->dimToScreen(Point(x, y) + scribbleArea->getPageOrigin(0));
+    replayTime = t;
+    scribbleArea->scribbleInput->doInputEvent(s.x, s.y, p, (inputsource_t)src, (inputevent_t)ev, mm, t);
+    return true;
+  }
+  if(op == "mt") {
+    int ev1, ev2;  Dim x1, y1, x2, y2;
+    if(!(in >> ev1 >> x1 >> y1 >> ev2 >> x2 >> y2)) return false;
+    mtinput(inputevent_t(ev1), x1, y1, inputevent_t(ev2), x2, y2);
+    return true;
+  }
+  if(op == "mode") { int m;  if(!(in >> m)) return false;  scribbleMode->setMode(m);  return true; }
+  if(op == "cmd") { int c;  if(!(in >> c)) return false;  scribbleDoc->doCommand(c);  return true; }
+  if(op == "pen") {
+    unsigned int argb, flags;  Dim w, wr = 0, pr = 0, spd = 0, ang = 0, dash = 0, gap = 0;
+    if(!(in >> argb >> w >> flags)) return false;
+    in >> wr >> pr >> spd >> ang >> dash >> gap;
+    scribbleDoc->app->setPen(ScribblePen(Color::fromArgb(argb), w, flags, wr, pr, spd, ang, dash, gap));
+    return true;
+  }
+  if(op == "cfg") {
+    std::string k, v;
+    if(!(in >> k >> v)) return false;
+    return scribbleDoc->cfg->setConfigValue(k.c_str(), v.c_str());
+  }
+  if(op == "props") {
+    Dim w, h, xr, yr, ml;  unsigned int c, rc;  int all, docdef, global;
+    if(!(in >> w >> h >> xr >> yr >> ml >> c >> rc >> all >> docdef >> global)) return false;
+    PageProperties props(w, h, xr, yr, ml, Color::fromArgb(c), Color::fromArgb(rc));
+    scribbleDoc->setPageProperties(&props, all, docdef, global);
+    return true;
+  }
+  if(op == "view") {
+    int pg;  Dim x, y;
+    if(!(in >> pg >> x >> y)) return false;
+    scribbleArea->gotoPos(pg, Point(x, y));
+    return true;
+  }
+  if(op == "page") { int pg;  if(!(in >> pg)) return false;  scribbleArea->gotoPage(pg);  return true; }
+  if(op == "screen") {
+    Dim l, t, w, h;
+    if(!(in >> l >> t >> w >> h)) return false;
+    scribbleArea->screenRect = Rect::ltwh(l, t, w, h);
+    return true;
+  }
+  if(op == "hyperref") {
+    auto w = splitWords(line, 2);
+    if(w.size() != 2) return false;
+    scribbleArea->createHyperRef(w[1].c_str());
+    return true;
+  }
+  if(op == "hyperref-bookmark") {
+    Dim y;
+    if(!(in >> y)) return false;
+    scribbleArea->createHyperRef(bookmarkArea->findBookmark(scribbleDoc->document, y));
+    return true;
+  }
+  if(op == "clearsel") { scribbleArea->clearSelection();  return true; }
+  if(op == "recentsel") { scribbleArea->recentStrokeSelect();  return true; }
+  if(op == "paintbookmarks") {
+    screenPaint->beginFrame();
+    bookmarkArea->doPaintEvent(screenPaint);
+    screenPaint->endFrame();
+    return true;
+  }
+  if(op == "strokeprops") {
+    unsigned int argb;  Dim w;
+    if(!(in >> argb >> w)) return false;
+    scribbleArea->setStrokeProperties(StrokeProperties(Color::fromArgb(argb), w));
+    return true;
+  }
+  if(op == "selmode") { int m;  if(!(in >> m)) return false;  scribbleMode->moveSelMode = m;  return true; }
+  if(op == "pathrel") { int r;  if(!(in >> r)) return false;  SvgWriter::DEFAULT_PATH_DATA_REL = r;  return true; }
+  if(op == "clipsvg") {
+    auto w = splitWords(line, 2);
+    if(w.size() != 2) return false;
+    Clipboard* clip = scribbleDoc->app->importExternalDoc(SvgParser().parseFragment(w[1].c_str()));
+    scribbleDoc->app->clipboard.reset(clip);
+    scribbleDoc->app->clipboardPage = NULL;
+    return true;
+  }
+  if(op == "newdoc") { scribbleDoc->newDocument();  return true; }
+  if(op == "reopen") {
+    std::string ext;  int flags, loadall;
+    if(!(in >> ext >> flags >> loadall)) return false;
+    std::string path = replayTmpDir + "/replay." + ext;
+    scribbleDoc->saveDocument(path.c_str(), Document::saveflags_t(flags));
+    scribbleDoc->openDocument(path.c_str());
+    if(loadall) {
+      scribbleDoc->document->ensurePagesLoaded();
+      scribbleDoc->document->deleteFiles();
+    }
+    return true;
+  }
+  return false;
+}
+
+static void writeTransform(std::ostream& out, const Transform2D& tf)
+{
+  out << "\"dx\": " << R(tf.xoffset()) << ", \"dy\": " << R(tf.yoffset()) << ", \"transform\": [";
+  for(int ii = 0; ii < 6; ++ii)
+    out << (ii ? ", " : "") << R(tf.m[ii]);
+  out << "]";
+}
+
+static void writeElement(std::ostream& out, Element* e, ReplayIds& ids, const Transform2D& parenttf,
+    bool penpoints, const std::string& indent)
+{
+  const Transform2D& tf = e->node->getTransform();
+  out << indent << "{\"id\": " << ids.recs[e].id << ", ";
+  writeTransform(out, tf);
+  if(penpoints && e->isPathElement()) {
+    // Element::toPenPoints gives the centerline in the element's own coordinates; write it in page units
+    Transform2D total = parenttf * tf;
+    out << ",\n" << indent << " \"penPoints\": [";
+    bool first = true;
+    for(const PenPoint& pp : ScribbleTest::penPoints(e)) {
+      if(pp.moveTo())
+        out << (first ? "[" : "], [");
+      else
+        out << ", ";
+      Point p = total.map(pp.p);
+      out << "[" << R(p.x) << ", " << R(p.y) << "]";
+      first = false;
+    }
+    out << (first ? "]" : "]]");
+  }
+  if(e->isMultiStroke()) {
+    out << ",\n" << indent << " \"children\": [\n";
+    bool first = true;
+    for(Element* c : e->children()) {
+      out << (first ? "" : ",\n");
+      writeElement(out, c, ids, parenttf * tf, penpoints, indent + "  ");
+      first = false;
+    }
+    out << "]";
+  }
+  out << "}";
+}
+
+static void writeIdList(std::ostream& out, const std::set<int>& ids)
+{
+  out << "[";
+  bool first = true;
+  for(int id : ids) { out << (first ? "" : ", ") << id;  first = false; }
+  out << "]";
+}
+
+// Replay casedir/trace.txt on casedir/input.html (if present) and write, next to them, each page as
+//  result-p<N>.svg (Page::saveSVGFile, native transforms kept) and expected.json.  A case directory named
+//  upstream-test<N> is also saved as runAll saves test<N> and compared with SCRIBBLE_TEST_PATH/test<N>_ref.html.
+void ScribbleTest::replay(const std::string& casedir)
+{
+  std::vector<char> tracebuf;
+  if(!readFile(&tracebuf, (casedir + "/trace.txt").c_str()) || tracebuf.empty()) {
+    ++nFailed;
+    resultStr += "\n" + casedir + ": cannot read trace.txt";
+    return;
+  }
+  srandpp(1);
+  SvgWriter::DEFAULT_PATH_DATA_REL = false;
+  doCommand(ID_RESETZOOM);
+  setupTest(casedir + "/input.html");
+  scribbleArea->gotoPos(0, Point(0,0));
+
+  ReplayIds ids;
+  ids.snapshot(scribbleDoc->document);
+  bool penpoints = false;
+  std::istringstream lines(std::string(tracebuf.begin(), tracebuf.end()));
+  std::string line;
+  for(int lineno = 1; std::getline(lines, line); ++lineno) {
+    if(!replayLine(line, casedir)) {
+      ++nFailed;
+      resultStr += fstring("\n%s/trace.txt:%d: cannot replay: %s", casedir.c_str(), lineno, line.c_str());
+      return;
+    }
+    penpoints = penpoints || StringRef(line).startsWith(fstring("mode %d", MODE_ERASEFREE).c_str());
+    ids.snapshot(scribbleDoc->document);
+  }
+
+  Document* doc = scribbleDoc->document;
+  doc->ensurePagesLoaded();
+  std::set<int> selected;
+  std::ostringstream json;
+  json << "{\n\"pages\": [";
+  for(size_t pp = 0; pp < doc->pages.size(); ++pp) {
+    Page* page = doc->pages[pp];
+    page->saveSVGFile(fstring("%s/result-p%d.svg", casedir.c_str(), int(pp)).c_str());
+    json << (pp ? ",\n" : "\n") << " {\"elements\": [\n";
+    bool first = true;
+    for(Element* e : page->children()) {
+      json << (first ? "" : ",\n");
+      writeElement(json, e, ids, Transform2D(), penpoints, "  ");
+      first = false;
+      if(scribbleArea->currSelection && e->isSelected(scribbleArea->currSelection))
+        selected.insert(ids.recs[e].id);
+    }
+    json << "]}";
+  }
+  std::set<int> deleted;
+  for(int id = 0; id < ids.nextId; ++id)
+    if(!ids.live.count(id)) deleted.insert(id);
+  json << "],\n\"selected\": ";
+  writeIdList(json, selected);
+  json << ",\n\"deleted\": ";
+  writeIdList(json, deleted);
+  json << "\n}\n";
+  std::string jsonstr = json.str();
+  std::ofstream jsonfile((casedir + "/expected.json").c_str(), std::ios::binary);
+  jsonfile.write(jsonstr.data(), jsonstr.size());
+  jsonfile.close();
+
+  int testnum = -1;
+  std::string name = FSPath(casedir).fileName();
+  if(sscanf(name.c_str(), "upstream-test%d", &testnum) == 1) {
+    std::string outfile = replayTmpDir + fstring("/test%d_out.html", testnum);
+    saveTestOutput(outfile);
+    std::string reffile = fstring("%s/test%d_ref.html", SCRIBBLE_TEST_PATH, testnum);
+    if(testCompareFiles(outfile.c_str(), reffile.c_str(), true))
+      scribbleDoc->document->deleteFiles();
+    else {
+      ++nFailed;
+      resultStr += "\n" + name + ": replay does not reproduce " + reffile + " (output kept at " + outfile + ")";
+    }
+  }
+}
+
+void ScribbleTest::replayAll(const std::string& casesdir)
+{
+  nFailed = 0;
+  resultStr.clear();
+  // global setup as in runAll
+  Dim unitsPerPx = ScribbleView::unitsPerPx;
+  ScribbleView::unitsPerPx = 1;
+  SvgWriter::DEFAULT_SAVE_IMAGE_SCALED = 1;
+  Page::BLANK_Y_RULING = scribbleConfig->Float("blankYRuling");
+  Element::SVG_NO_TIMESTAMP = true;
+  Page::clock = replayClock;
+  const char* tmp = getenv("WRITE_REPLAY_TMP");
+  replayTmpDir = tmp ? tmp : outPath;
+
+  std::vector<std::string> cases = lsDirectory(FSPath(casesdir));
+  std::sort(cases.begin(), cases.end());
+  int ncases = 0;
+  for(const std::string& c : cases) {
+    if(c.empty() || c.back() != '/') continue;
+    replay(FSPath(casesdir, c).filePath());
+    ++ncases;
+  }
+
+  Page::clock = mSecSinceEpoch;
+  srandpp(mSecSinceEpoch());
+  SvgWriter::DEFAULT_PATH_DATA_REL = true;
+  Element::SVG_NO_TIMESTAMP = false;
+  ScribbleView::unitsPerPx = unitsPerPx;
+  ScribbleApp::app->loadConfig();
+  resultStr = fstring("Replayed %d cases from %s with %d failures.", ncases, casesdir.c_str(), nFailed) + resultStr;
+  if(exitAfterTest) {
+    SCRIBBLE_LOG(resultStr.c_str());
+    exit(nFailed ? 1 : 0);
+  }
 }

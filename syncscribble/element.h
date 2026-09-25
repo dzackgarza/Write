@@ -203,6 +203,7 @@ public:
 
 protected:
   ~Element() override {}
+  friend class ScribbleTest;  // replay reads toPenPoints
 
 private:
   std::vector<PenPoint> toPenPoints();

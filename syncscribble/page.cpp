@@ -7,6 +7,7 @@
 
 Dim Page::BLANK_Y_RULING = 40;
 bool Page::enableDropShadow = true;
+Timestamp (*Page::clock)() = mSecSinceEpoch;
 
 // for legacy support (esp. ScribbleTest); note that we force paper to be opaque
 PageProperties::PageProperties(Dim w, Dim h, Dim xr, Dim yr, Dim ml, Color c, Color rc)
@@ -549,7 +550,7 @@ void Page::addStroke(Element* s, Element* next)
   if(document->history->undoable())
     document->history->addItem(new StrokeAddedItem(s, this, next));
   if(s->timestamp() <= 0)
-    s->setTimestamp(mSecSinceEpoch());
+    s->setTimestamp(clock());
   onAddStroke(s);
 }
 

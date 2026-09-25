@@ -1,6 +1,7 @@
 #include "scribbleinput.h"
 #include "ugui/svggui.h"
 #include "scribbleview.h"
+#include <cstdlib>
 
 
 // instance methods
@@ -8,8 +9,29 @@
 int ScribbleInput::pressedKey = 0;
 bool ScribbleInput::disableTouch = false;
 bool ScribbleInput::simulatePenBtn = false;
+FILE* ScribbleInput::traceLog = NULL;
 
-ScribbleInput::ScribbleInput(ScribbleView* _parent) : parent(_parent) {}
+ScribbleInput::ScribbleInput(ScribbleView* _parent) : parent(_parent)
+{
+  // WRITE_TRACE_LOG=<file>: record pen input by hand in the replay grammar (scribbletest.cpp ScribbleTest::replay)
+  const char* tracepath = getenv("WRITE_TRACE_LOG");
+  if(tracepath && !traceLog)
+    traceLog = fopen(tracepath, "a");
+}
+
+// shortest decimal string that parses back to the same double, so replayed coordinates are exact
+std::string ScribbleInput::traceReal(double x)
+{
+  // the build is C++14, so no std::to_chars: take the fewest decimals that round-trip
+  char buf[64];
+  for(int prec = 0; prec <= 17; ++prec) {
+    snprintf(buf, sizeof(buf), "%.*f", prec, x);
+    if(strtod(buf, NULL) == x)
+      return std::string(buf);
+  }
+  snprintf(buf, sizeof(buf), "%.17g", x);
+  return std::string(buf);
+}
 
 void ScribbleInput::loadConfig()
 {
@@ -172,6 +194,15 @@ void ScribbleInput::doInputEvent(InputEvent& event)
         p.x, p.y, p.pressure, srcs[event.source], events[p.event+1], event.modemod, (unsigned int)event.t);
   //SCRIBBLE_LOG("ie(%.3f, %.3f, %.3f, %d, %d, %d);", relx, rely, pressure, (int)source, (int)eventtype, modemod);
 #endif
+  // the logger above, enabled by traceLog: one "ie x y p src ev mm t" line per single-point event, with
+  //  (x, y) in page units relative to page 0's origin, independent of pan and zoom
+  Point origin;
+  if(traceLog && event.points.size() == 1 && parent->tracePageOrigin(&origin)) {
+    const InputPoint& ip = event.points[0];
+    Point pos = parent->screenToDim(Point(ip.x, ip.y)) - origin;
+    fprintf(traceLog, "ie %s %s %s %d %d %d %lld\n", traceReal(pos.x).c_str(), traceReal(pos.y).c_str(),
+        traceReal(ip.pressure).c_str(), int(event.source), int(ip.event), event.modemod, (long long)event.t);
+  }
   // ignored events
   if(event.source == INPUTSOURCE_TOUCH && !isTouchAccepted())
     return;
