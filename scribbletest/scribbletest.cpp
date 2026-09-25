@@ -1954,7 +1954,13 @@ void ScribbleTest::replayAll(const std::string& casesdir)
   int ncases = 0;
   for(const std::string& c : cases) {
     if(c.empty() || c.back() != '/') continue;
-    replay(FSPath(casesdir, c).filePath());
+    // a fresh config, document and view per case, so no case depends on the ones before it
+    ScribbleTest test(outPath);
+    test.nFailed = 0;
+    test.replayTmpDir = replayTmpDir;
+    test.replay(FSPath(casesdir, c).filePath());
+    nFailed += test.nFailed;
+    resultStr += test.resultStr;
     ++ncases;
   }
 
