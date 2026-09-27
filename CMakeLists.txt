@@ -34,9 +34,11 @@ target_include_directories(write_headless PUBLIC . syncscribble
 target_compile_definitions(write_headless PRIVATE PUGIXML_NO_XPATH PUGIXML_NO_EXCEPTIONS
   NO_PAINTER_GL NO_PAINTER_SW NO_PAINTER_SWU)
 
-include(CTest)
-if(BUILD_TESTING)
-  add_executable(write_headless_smoke headless/smoke.cpp)
-  target_link_libraries(write_headless_smoke PRIVATE write_headless)
-  add_test(NAME write_headless_smoke COMMAND write_headless_smoke)
+if(PROJECT_IS_TOP_LEVEL)
+  include(CTest)
+  if(BUILD_TESTING)
+    add_executable(write_headless_smoke headless/smoke.cpp)
+    target_link_libraries(write_headless_smoke PRIVATE write_headless)
+    add_test(NAME write_headless_smoke COMMAND write_headless_smoke)
+  endif()
 endif()
